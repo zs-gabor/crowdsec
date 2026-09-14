@@ -424,18 +424,17 @@ fi
 
 # Enroll instance if enroll key is provided
 if isfalse "$DISABLE_LOCAL_API" && isfalse "$DISABLE_ONLINE_API" && [ "$ENROLL_KEY" != "" ]; then
-    enroll_args=""
+    enroll_args=()
     if [ "$ENROLL_INSTANCE_NAME" != "" ]; then
-        enroll_args="--name $ENROLL_INSTANCE_NAME"
+        enroll_args+=(--name "$ENROLL_INSTANCE_NAME")
     fi
     if [ "$ENROLL_TAGS" != "" ]; then
         # shellcheck disable=SC2086
         for tag in ${ENROLL_TAGS}; do
-            enroll_args="$enroll_args --tags $tag"
+            enroll_args+=(--tags "$tag")
         done
     fi
-    # shellcheck disable=SC2086
-    cscli console enroll $enroll_args "$ENROLL_KEY"
+    cscli console enroll "${enroll_args[@]}" "$ENROLL_KEY"
 fi
 
 # crowdsec sqlite database permissions
@@ -484,7 +483,7 @@ if [ "$ENABLE_CONSOLE_ALL" != "" ]; then
 else
     CONSOLE_FLAGS=""
     if [ "$ENABLE_CONSOLE_MANAGEMENT" != "" ]; then
-        CONSOLE_FLAGS="$CONSOLE_FLAGS console_management"
+        echo "WARNING: ENABLE_CONSOLE_MANAGEMENT is deprecated and ignored; decision management is enabled automatically based on your console plan." >&2
     fi
     if [ "$ENABLE_CONSOLE_CONTEXT" != "" ]; then
         CONSOLE_FLAGS="$CONSOLE_FLAGS context"

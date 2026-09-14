@@ -2,6 +2,7 @@
 // returns: FlexInt / FlexBool tolerant primitives and the nested
 // FingerprintData / fingerprintBotAlias structures that mirror the JSON
 // payload one-to-one. Handwritten accessors live in fingerprint_helpers.go,
+// tolerant decoding of the object-shaped signals in fingerprint_flex.go,
 // proto ↔ struct conversion in fingerprint_proto.go, and mismatch detection
 // methods in fingerprint_mismatch.go.
 
@@ -111,6 +112,10 @@ func (fi FlexInt) Int() int {
         "hover": true,
         "anyHover": true,
         "colorDepth": 10
+      },
+      "keyboard": {
+        "layout": "Backquote,` Backslash,\\ BracketLeft,[ BracketRight,]",
+        "layoutSize": 4
       }
     },
     "browser": {
@@ -167,6 +172,10 @@ func (fi FlexInt) Int() int {
       "toSourceError": {
         "toSourceError": "TypeError:+Cannot+read+properties+of+null+(reading+usdfsh)",
         "hasToSource": false
+      },
+      "ai": {
+        "summarizerAvailability": "downloadable",
+        "summarizerLanguageAvailability": "available"
       }
     },
     "graphics": {
@@ -360,6 +369,7 @@ type fingerprintDevice struct {
 	ScreenResolution  fingerprintScreenResolution   `json:"screenResolution"`
 	MultimediaDevices fingerprintMultimediaDevices  `json:"multimediaDevices"`
 	MediaQueries      fingerprintDeviceMediaQueries `json:"mediaQueries"`
+	Keyboard          fingerprintDeviceKeyboard     `json:"keyboard"`
 }
 
 type fingerprintScreenResolution struct {
@@ -392,6 +402,14 @@ type fingerprintDeviceMediaQueries struct {
 	ColorDepth                 FlexInt  `json:"colorDepth"`
 }
 
+// Layout is the KeyboardLayoutMap serialized as "code,key" pairs joined by
+// spaces; both fields are "NA" (Layout) / 0 (LayoutSize, via FlexInt) on
+// browsers without navigator.keyboard.
+type fingerprintDeviceKeyboard struct {
+	Layout     string  `json:"layout"`
+	LayoutSize FlexInt `json:"layoutSize"`
+}
+
 type fingerprintBrowser struct {
 	UserAgent         string                              `json:"userAgent"`
 	Features          fingerprintBrowserFeatures          `json:"features"`
@@ -401,6 +419,7 @@ type fingerprintBrowser struct {
 	ETSL              FlexInt                             `json:"etsl"`
 	Maths             string                              `json:"maths"`
 	ToSourceError     fingerprintBrowserToSourceError     `json:"toSourceError"`
+	AI                fingerprintBrowserAI                `json:"ai"`
 }
 
 type fingerprintBrowserFeatures struct {
@@ -433,6 +452,12 @@ type fingerprintBrowserFeatures struct {
 	FencedFrame               FlexBool `json:"fencedFrame"`
 	Sanitizer                 FlexBool `json:"sanitizer"`
 	OTPCredential             FlexBool `json:"otpCredential"`
+	SumPrecise                FlexBool `json:"sumPrecise"`
+}
+
+type fingerprintBrowserAI struct {
+	SummarizerAvailability         string `json:"summarizerAvailability"`
+	SummarizerLanguageAvailability string `json:"summarizerLanguageAvailability"`
 }
 
 type fingerprintBrowserPlugins struct {

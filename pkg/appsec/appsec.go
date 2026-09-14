@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -204,9 +205,20 @@ func (r AppsecTempResponse) Clone() AppsecTempResponse {
 	return clone
 }
 
-type AppsecDropInfo struct {
+// HookOutcome records a terminal decision taken by an expr hook: the current
+// band stops before (or instead of) WAF evaluation, and the request gets
+// Action. Interruption is set only for disruptive outcomes (DropRequest) —
+// an allow outcome carries none, so it produces neither event nor alert.
+type HookOutcome struct {
+	Action       string
 	Reason       string
 	Interruption *corazatypes.Interruption
+}
+
+// IsDisruptive reports whether the outcome must be treated like a rule match:
+// build an event, run on_match, apply a blocking remediation.
+func (o *HookOutcome) IsDisruptive() bool {
+	return o != nil && o.Interruption != nil
 }
 
 // SubmissionRejectInfo signals that an on_challenge_submit hook called
@@ -222,8 +234,11 @@ type AppsecRequestState struct {
 	CurrentPhase phase
 	Response     AppsecTempResponse
 
-	InBandDrop    *AppsecDropInfo
-	OutOfBandDrop *AppsecDropInfo
+	// InBandOutcome / OutOfBandOutcome hold the terminal decision an expr
+	// hook took for that band, if any. Per-band because a single state is
+	// reused across the in-band and out-of-band phases.
+	InBandOutcome    *HookOutcome
+	OutOfBandOutcome *HookOutcome
 
 	PendingAction   *string
 	PendingHTTPCode *int
@@ -243,6 +258,11 @@ type AppsecRequestState struct {
 	// on ResetResponse. The bypass for subsequent requests is carried by
 	// the allowlist cookie itself, not by this flag.
 	ChallengeBypassed bool
+
+	// ChallengeCookieValid is set when the request presented a cookie that
+	// passed ValidCookie. Not cleared by ResetResponse: it stays true for
+	// the whole request, out-of-band included.
+	ChallengeCookieValid bool
 
 	// ChallengeExempt is set by the ExemptFromChallenge expr helper to exempt
 	// the current request from the bot challenge: SendChallenge becomes a no-op
@@ -265,6 +285,9 @@ type AppsecRequestState struct {
 	// rule expression don't redo the work (or re-emit observability).
 	// nil until the first call.
 	LastMismatchReport *challenge.MismatchReport
+
+	// Tracks the request score + reasons
+	RequestScore RequestScore
 
 	// HookVars is a per-request scratch space exposed to expr hooks as
 	// `hook_vars`. Helpers (e.g. ValidateRequestWithSchema) publish string
@@ -298,15 +321,38 @@ func (s *AppsecRequestState) ResetResponse(cfg *AppsecConfig) {
 	s.HooksHalted = false
 }
 
-func (s *AppsecRequestState) DropInfo(request *ParsedRequest) *AppsecDropInfo {
+// HasValidChallengeCookie reports whether the request has cleared the
+// challenge: either it presented a valid cookie, or a hook exempted it. A
+// cookie minted during this request (submission, GrantChallengeCookie)
+// doesn't count — the visitor presents it on the next hop.
+func (s *AppsecRequestState) HasValidChallengeCookie() bool {
+	return s.ChallengeCookieValid || s.ChallengeExempt
+}
+
+// Outcome returns the terminal hook decision recorded for the request's band,
+// or nil if no hook took one. The runner uses it to return early, whatever the
+// decision was.
+func (s *AppsecRequestState) Outcome(request *ParsedRequest) *HookOutcome {
 	switch {
 	case request != nil && request.IsInBand:
-		return s.InBandDrop
+		return s.InBandOutcome
 	case request != nil && request.IsOutBand:
-		return s.OutOfBandDrop
+		return s.OutOfBandOutcome
 	default:
 		return nil
 	}
+}
+
+// DropInfo returns the band's outcome only when it is disruptive. Event
+// building and on_match treat such an outcome exactly like a rule match; an
+// allow outcome must stay invisible to them.
+func (s *AppsecRequestState) DropInfo(request *ParsedRequest) *HookOutcome {
+	outcome := s.Outcome(request)
+	if !outcome.IsDisruptive() {
+		return nil
+	}
+
+	return outcome
 }
 
 func (s *AppsecRequestState) ApplyPendingResponse() {
@@ -401,16 +447,9 @@ type AppsecRuntimeConfig struct {
 	BodySettings BodySettings
 }
 
-// emitChallengeEvent builds and sends a challenge lifecycle event to the
-// pipeline. It is a no-op when no output channel is wired. Challenge handling is
-// an in-band concern, so we never emit during the out-of-band phase — a common
-// pre_eval/post_eval hook calling SendChallenge() runs in both phases, and the
-// out-of-band invocation is already a no-op for the client.
-func (w *AppsecRuntimeConfig) emitChallengeEvent(request *ParsedRequest, info ChallengeEventInfo) {
-	if w.OutChan == nil || !request.IsInBand {
-		return
-	}
-
+// recordChallengeMetric is kept out of emission so counters still move when no
+// output channel is wired.
+func (*AppsecRuntimeConfig) recordChallengeMetric(request *ParsedRequest, info ChallengeEventInfo) {
 	labels := prometheus.Labels{
 		"source":        request.RemoteAddrNormalized,
 		"appsec_engine": request.AppsecEngine,
@@ -446,8 +485,32 @@ func (w *AppsecRuntimeConfig) emitChallengeEvent(request *ParsedRequest, info Ch
 		}
 		metrics.AppsecChallengeRejected.With(rejectedLabels).Inc()
 	}
+}
 
-	w.OutChan <- ChallengeEventFromRequest(request, w.Labels, request.UUID, info)
+// Challenge handling is an in-band concern, so we never emit during the
+// out-of-band phase: a common pre_eval/post_eval hook calling SendChallenge()
+// runs in both phases, and the out-of-band invocation is already a no-op for the
+// client. The log event is deliberately not gated on state.Response.SendEvent —
+// CancelEvent() must not silence challenge telemetry.
+func (w *AppsecRuntimeConfig) emitChallenge(state *AppsecRequestState, request *ParsedRequest, info ChallengeEventInfo) {
+	if !request.IsInBand {
+		return
+	}
+
+	w.recordChallengeMetric(request, info)
+
+	evt := ChallengeEventFromRequest(request, w.Labels, request.UUID, info)
+	StampHookVars(&evt, state)
+
+	// A submission we refused is the only moment worth an alert of its own.
+	var overflow *pipeline.Event
+
+	switch info.Reason {
+	case ChallengeReasonRejected, ChallengeReasonFailed:
+		overflow = w.buildChallengeOverflow(state, request, info, evt.Appsec.HookVars)
+	}
+
+	w.EmitAlertAndEvent(overflow, &evt)
 }
 
 // ExemptFromChallenge flags the current request as exempt from the bot
@@ -467,7 +530,7 @@ func (*AppsecRuntimeConfig) ExemptFromChallenge(state *AppsecRequestState, reque
 	}
 
 	// Challenge handling is an in-band concern; don't emit during the
-	// out-of-band phase (mirrors emitChallengeEvent).
+	// out-of-band phase (mirrors emitChallenge).
 	if request.IsInBand {
 		metrics.AppsecChallengeExempt.With(prometheus.Labels{
 			"source":        request.RemoteAddrNormalized,
@@ -569,10 +632,59 @@ func (w *AppsecRuntimeConfig) ClearResponse(state *AppsecRequestState) {
 	state.ResetResponse(w.Config)
 }
 
+// requestBand names the phase a helper is running in, for tags and logs.
+func requestBand(request *ParsedRequest) (string, error) {
+	switch {
+	case request == nil:
+		return "", errors.New("unable to determine request band: no request")
+	case request.IsInBand:
+		return "inband", nil
+	case request.IsOutBand:
+		return "outofband", nil
+	default:
+		return "", errors.New("unable to determine request band")
+	}
+}
+
+// setOutcome records a terminal hook decision for the request's band and
+// reports whether it was kept. The first decision wins: a hook that drops and
+// then skips (or the reverse) gets the one it took first, rather than one
+// picked by the order of the runner's checks.
+func (w *AppsecRuntimeConfig) setOutcome(state *AppsecRequestState, request *ParsedRequest, outcome *HookOutcome) (bool, error) {
+	if existing := state.Outcome(request); existing != nil {
+		w.Logger.Warnf("ignoring %s outcome (%s): request already had a %s outcome (%s)",
+			outcome.Action, outcome.Reason, existing.Action, existing.Reason)
+
+		return false, nil
+	}
+
+	switch {
+	case request == nil:
+		return false, errors.New("unable to determine request band: no request")
+	case request.IsInBand:
+		state.InBandOutcome = outcome
+	case request.IsOutBand:
+		state.OutOfBandOutcome = outcome
+	default:
+		return false, errors.New("unable to determine request band")
+	}
+
+	return true, nil
+}
+
 func (w *AppsecRuntimeConfig) DropRequest(state *AppsecRequestState, request *ParsedRequest, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "request dropped by drop helper"
+	}
+
+	band, err := requestBand(request)
+	if err != nil {
+		return err
+	}
+
+	if state.Tx.Tx == nil {
+		return fmt.Errorf("%s transaction not initialized", band)
 	}
 
 	interrupt := &corazatypes.Interruption{
@@ -580,34 +692,57 @@ func (w *AppsecRuntimeConfig) DropRequest(state *AppsecRequestState, request *Pa
 		Action: "deny",
 		Status: w.Config.UserBlockedHTTPCode,
 		Data:   reason,
-		Tags:   []string{"crowdsec:drop-request"},
+		Tags:   []string{"crowdsec:drop-request", "crowdsec:drop-request:" + band},
 	}
 
-	switch {
-	case request.IsInBand:
-		if state.Tx.Tx == nil {
-			return errors.New("inband transaction not initialized")
-		}
-		interrupt.Tags = append(interrupt.Tags, "crowdsec:drop-request:inband")
-		state.InBandDrop = &AppsecDropInfo{Reason: reason, Interruption: interrupt}
+	recorded, err := w.setOutcome(state, request, &HookOutcome{
+		Action:       BanRemediation,
+		Reason:       reason,
+		Interruption: interrupt,
+	})
+	if err != nil || !recorded {
+		return err
+	}
+
+	if request.IsInBand {
 		state.Response.InBandInterrupt = true
 		state.Response.Action = w.DefaultRemediation
 		state.Response.BouncerHTTPResponseCode = w.Config.BouncerBlockedHTTPCode
 		state.Response.UserHTTPResponseCode = w.Config.UserBlockedHTTPCode
-		state.Tx.Interrupt(interrupt)
-		w.Logger.Debugf("drop request helper triggered for inband phase: %s", reason)
-	case request.IsOutBand:
-		if state.Tx.Tx == nil {
-			return errors.New("outofband transaction not initialized")
-		}
-		interrupt.Tags = append(interrupt.Tags, "crowdsec:drop-request:outofband")
-		state.OutOfBandDrop = &AppsecDropInfo{Reason: reason, Interruption: interrupt}
+	} else {
 		state.Response.OutOfBandInterrupt = true
-		state.Tx.Interrupt(interrupt)
-		w.Logger.Debugf("drop request helper triggered for out-of-band phase: %s", reason)
-	default:
-		return errors.New("unable to determine request band for drop helper")
 	}
+
+	state.Tx.Interrupt(interrupt)
+	w.Logger.Debugf("drop request helper triggered for %s phase: %s", band, reason)
+
+	return nil
+}
+
+// SkipProcessing is the allow-side counterpart of DropRequest: the current
+// band returns early with the default pass response, without evaluating a
+// single WAF rule and without producing an event or an alert. post_eval hooks
+// still run, as they do after a drop.
+func (w *AppsecRuntimeConfig) SkipProcessing(state *AppsecRequestState, request *ParsedRequest, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "request skipped by skip helper"
+	}
+
+	band, err := requestBand(request)
+	if err != nil {
+		return err
+	}
+
+	recorded, err := w.setOutcome(state, request, &HookOutcome{
+		Action: AllowRemediation,
+		Reason: reason,
+	})
+	if err != nil || !recorded {
+		return err
+	}
+
+	w.Logger.Debugf("skip processing helper triggered for %s phase: %s", band, reason)
 
 	return nil
 }
@@ -1030,9 +1165,8 @@ func (wc *AppsecConfig) Build(ctx context.Context, hub *cwhub.Hub) (*AppsecRunti
 // state, when non-nil, is consulted between rule iterations: if
 // state.HooksHalted is true (set by a terminal expr helper such as
 // RejectSubmission or the on_challenge_submit GrantChallengeCookie),
-// remaining rules in this phase are skipped. ProcessOnLoadRules and
-// the non-submit phases pass nil — they have no terminal actions
-// today.
+// remaining rules in this phase are skipped. ProcessOnLoadRules passes
+// nil — it has no request state at all.
 func (w *AppsecRuntimeConfig) processHooks(hooks []Hook, env map[string]interface{}, hookType string, state *AppsecRequestState) error {
 	has_match := false
 
@@ -1146,19 +1280,24 @@ func (w *AppsecRuntimeConfig) ProcessOnChallengeRules(ctx context.Context, state
 	// on_challenge inspection happens on subsequent cookie-bearing requests.
 	if path == challenge.ChallengeSubmitPath && request.HTTPRequest.Method == http.MethodPost {
 		w.Logger.Debugf("validating challenge response")
-		w.emitChallengeEvent(request, ChallengeEventInfo{Reason: ChallengeReasonSubmitted})
+		w.emitChallenge(state, request, ChallengeEventInfo{Reason: ChallengeReasonSubmitted})
 
 		ck, fpData, provenDifficulty, err := w.ChallengeRuntime.ValidateChallengeResponse(request.HTTPRequest, request.Body)
 		if err != nil {
 			w.Logger.Errorf("challenge validation failed: %s", err)
-			w.emitChallengeEvent(request, ChallengeEventInfo{
+			info := ChallengeEventInfo{
 				Reason:     ChallengeReasonFailed,
 				FailReason: err.Error(),
 				FailErr:    err,
-			})
+			}
+			w.emitChallenge(state, request, info)
 			return w.setChallengeResponse(state, http.StatusOK, bodyChallengeFailed,
 				map[string]string{"Content-Type": "application/json", "Cache-Control": "no-cache, no-store"}, nil)
 		}
+
+		// ValidateChallengeResponse rewrote HTTPRequest.URL.Path to the original
+		// page the visitor requested (recovered from the challenge payload).
+		request.URI = request.HTTPRequest.URL.Path
 
 		// Populate state.Fingerprint so on_challenge_submit expressions see
 		// the freshly-decrypted fingerprint via the env. CookiePowDifficulty
@@ -1175,16 +1314,19 @@ func (w *AppsecRuntimeConfig) ProcessOnChallengeRules(ctx context.Context, state
 			// The expr-side RejectSubmission helper emits the reject log
 			// itself (with the operator-chosen verbosity), so we don't
 			// re-log here — just serve the rejection envelope.
-			w.emitChallengeEvent(request, ChallengeEventInfo{
+			info := ChallengeEventInfo{
 				Reason:      ChallengeReasonRejected,
 				FailReason:  state.SubmissionRejection.Reason,
 				Fingerprint: &fpData,
-			})
+				Score:       state.RequestScore.Total(),
+				ScoreDetail: state.RequestScore.String(),
+			}
+			w.emitChallenge(state, request, info)
 			return w.setChallengeResponse(state, http.StatusOK, bodyChallengeRejected,
 				map[string]string{"Content-Type": "application/json", "Cache-Control": "no-cache, no-store"}, nil)
 		}
 
-		w.emitChallengeEvent(request, ChallengeEventInfo{
+		w.emitChallenge(state, request, ChallengeEventInfo{
 			Reason:      ChallengeReasonSolved,
 			Difficulty:  state.CookiePowDifficulty,
 			Fingerprint: &fpData,
@@ -1216,6 +1358,7 @@ func (w *AppsecRuntimeConfig) ProcessOnChallengeRules(ctx context.Context, state
 			fp.AllowlistReason = cookieData.AllowlistReason
 			state.Fingerprint = &fp
 			state.CookiePowDifficulty = cookieData.PowDifficulty
+			state.ChallengeCookieValid = true
 			// An allowlist cookie minted on a prior request must short-circuit
 			// SendChallenge on every replay, exactly like a GrantChallengeCookie
 			// call within the current request would. Without this, the visitor
@@ -1235,7 +1378,7 @@ func (w *AppsecRuntimeConfig) ProcessOnChallengeRules(ctx context.Context, state
 		return nil
 	}
 
-	return w.processHooks(w.CompiledOnChallenge, GetOnChallengeEnv(ctx, w, state, request), "on_challenge", nil)
+	return w.processHooks(w.CompiledOnChallenge, GetOnChallengeEnv(ctx, w, state, request), "on_challenge", state)
 }
 
 func (w *AppsecRuntimeConfig) ProcessPreEvalRules(ctx context.Context, state *AppsecRequestState, request *ParsedRequest) error {
@@ -1519,6 +1662,32 @@ func (w *AppsecRuntimeConfig) EvaluateMismatches(state *AppsecRequestState, requ
 	return report
 }
 
+const (
+	hookVarRequestScore = "request_score"
+	// Weighted form ("cdp=100,utc_timezone=15") so this hookvar and the
+	// event/alert key of the same name never disagree on format.
+	hookVarRequestScoreReasons = "request_score_reasons"
+)
+
+func (w *AppsecRuntimeConfig) AddRequestScore(state *AppsecRequestState, points int, reason string) error {
+	total := state.RequestScore.Add(points, reason)
+
+	if state.HookVars != nil {
+		state.HookVars[hookVarRequestScore] = strconv.Itoa(total)
+		state.HookVars[hookVarRequestScoreReasons] = state.RequestScore.String()
+	}
+
+	if w.Logger != nil {
+		w.Logger.WithFields(log.Fields{
+			"reason": reason,
+			"points": points,
+			"total":  total,
+		}).Debug("request score updated")
+	}
+
+	return nil
+}
+
 // emitMismatchObservability logs the report at Debug level and bumps the
 // per-reason/severity Prometheus counter. Called exactly once per request
 // from EvaluateMismatches (guarded by state.LastMismatchReport being nil
@@ -1566,6 +1735,14 @@ func (w *AppsecRuntimeConfig) SendChallenge(ctx context.Context, state *AppsecRe
 		return errors.New("SendChallenge can only be called from an in-band hook (on_challenge or post_eval)")
 	}
 
+	// A hook already took a terminal decision for this band (DropRequest,
+	// SkipProcessing). Serving a challenge on top of it produced an
+	// incoherent response: a "ban" remediation carrying a challenge page.
+	if outcome := state.Outcome(request); outcome != nil {
+		w.Logger.Warnf("SendChallenge no-op: request already %s (%s)", outcome.Action, outcome.Reason)
+		return nil
+	}
+
 	// GrantChallengeCookie earlier in the same request already minted an
 	// allowlist cookie; refuse to overwrite it with a challenge page.
 	if state.ChallengeBypassed {
@@ -1601,10 +1778,12 @@ func (w *AppsecRuntimeConfig) SendChallenge(ctx context.Context, state *AppsecRe
 		return err
 	}
 
-	w.emitChallengeEvent(request, ChallengeEventInfo{
+	w.emitChallenge(state, request, ChallengeEventInfo{
 		Reason:      ChallengeReasonRequested,
 		Difficulty:  target,
 		Fingerprint: state.Fingerprint,
+		Score:       state.RequestScore.Total(),
+		ScoreDetail: state.RequestScore.String(),
 	})
 
 	return nil

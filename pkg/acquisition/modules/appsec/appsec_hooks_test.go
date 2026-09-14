@@ -18,7 +18,27 @@ import (
 	"github.com/crowdsecurity/crowdsec/pkg/appsec/challenge"
 	"github.com/crowdsecurity/crowdsec/pkg/exprhelpers"
 	"github.com/crowdsecurity/crowdsec/pkg/pipeline"
+	"github.com/crowdsecurity/crowdsec/pkg/types"
 )
+
+func findAppsecAlert(events []pipeline.Event) *pipeline.Event {
+	for i := range events {
+		if events[i].Type == pipeline.APPSEC && events[i].Overflow.Alert != nil {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
+// Looked up rather than indexed: alerts are interleaved with the log events.
+func findChallengeLog(events []pipeline.Event, reason appsec.ChallengeReason) *pipeline.Event {
+	for i := range events {
+		if events[i].Type == pipeline.LOG && events[i].Parsed["challenge_event"] == string(reason) {
+			return &events[i]
+		}
+	}
+	return nil
+}
 
 // jsonBody returns an io.ReadCloser that reads back `body` as many times as
 // the validator needs it, so we can reuse the same test request across phases.
@@ -693,6 +713,79 @@ func TestAppsecPreEvalHooks(t *testing.T) {
 				require.Equal(t, "drop requested by config", events[1].Appsec.MatchedRules[0]["name"])
 				require.Equal(t, "drop requested by config", events[1].Appsec.MatchedRules[0]["msg"])
 				require.Equal(t, "drop requested by config", events[1].Parsed["appsec_drop_reason"])
+			},
+		},
+		{
+			name:             "pre_eval : skip processing helper bypasses a matching rule",
+			expected_load_ok: true,
+			inband_rules: []appsec_rule.CustomRule{
+				{
+					Name:      "rule1",
+					Zones:     []string{"ARGS"},
+					Variables: []string{"foo"},
+					Match:     appsec_rule.Match{Type: "regex", Value: "^toto"},
+					Transform: []string{"lowercase"},
+				},
+			},
+			pre_eval: []appsec.Hook{
+				{Apply: []string{"SkipProcessing('skip requested by config')"}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/urllll",
+				Args:        url.Values{"foo": []string{"toto"}},
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Empty(t, events)
+				require.Len(t, responses, 1)
+				require.False(t, responses[0].InBandInterrupt)
+				require.False(t, responses[0].OutOfBandInterrupt)
+				require.Equal(t, appsec.AllowRemediation, responses[0].Action)
+				require.Equal(t, 200, responses[0].UserHTTPResponseCode)
+				require.Equal(t, 200, responses[0].BouncerHTTPResponseCode)
+			},
+		},
+		{
+			name:             "pre_eval : first outcome wins, skip then drop",
+			expected_load_ok: true,
+			pre_eval: []appsec.Hook{
+				{Apply: []string{"SkipProcessing('skip first')", "DropRequest('drop second')"}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/urllll",
+				Args:        url.Values{"foo": []string{"toto"}},
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Empty(t, events)
+				require.Len(t, responses, 1)
+				require.False(t, responses[0].InBandInterrupt)
+				require.Equal(t, appsec.AllowRemediation, responses[0].Action)
+			},
+		},
+		{
+			name:             "pre_eval : first outcome wins, drop then skip",
+			expected_load_ok: true,
+			pre_eval: []appsec.Hook{
+				{Apply: []string{"DropRequest('drop first')", "SkipProcessing('skip second')"}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/urllll",
+				Args:        url.Values{"foo": []string{"toto"}},
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Len(t, events, 3)
+				require.Len(t, responses, 1)
+				require.True(t, responses[0].InBandInterrupt)
+				require.Equal(t, appsec.BanRemediation, responses[0].Action)
+				require.Equal(t, "drop first", events[1].Parsed["appsec_drop_reason"])
 			},
 		},
 		{
@@ -1383,6 +1476,51 @@ func TestAppsecOnChallengeHooks(t *testing.T) {
 			},
 		},
 		{
+			name:             "post_eval SendChallenge is a no-op after pre_eval SkipProcessing",
+			expected_load_ok: true,
+			pre_eval: []appsec.Hook{
+				{Apply: []string{"SkipProcessing('skipped')"}},
+			},
+			post_eval: []appsec.Hook{
+				{Apply: []string{"SendChallenge()"}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/protected",
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Len(t, responses, 1)
+				require.Equal(t, appsec.AllowRemediation, responses[0].Action)
+				require.Empty(t, responses[0].UserHTTPBodyContent, "a skipped request must not carry a challenge page")
+				require.Empty(t, events)
+			},
+		},
+		{
+			name:             "post_eval SendChallenge is a no-op after pre_eval DropRequest",
+			expected_load_ok: true,
+			pre_eval: []appsec.Hook{
+				{Apply: []string{"DropRequest('dropped')"}},
+			},
+			post_eval: []appsec.Hook{
+				{Apply: []string{"SendChallenge()"}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/protected",
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Len(t, responses, 1)
+				require.True(t, responses[0].InBandInterrupt)
+				require.Equal(t, appsec.BanRemediation, responses[0].Action)
+				// The bug this guards: a "ban" remediation shipping a challenge page.
+				require.Empty(t, responses[0].UserHTTPBodyContent)
+			},
+		},
+		{
 			name:             "on_challenge: no cookie → user hooks skipped (filter would nil-deref)",
 			expected_load_ok: true,
 			// This filter would nil-deref if it ran without a fingerprint. The
@@ -1464,12 +1602,20 @@ func TestAppsecOnChallengeHooks(t *testing.T) {
 				require.Equal(t, appsec.ChallengeRemediation, responses[0].Action)
 				require.JSONEq(t, `{"status":"failed"}`, responses[0].UserHTTPBodyContent)
 				require.False(t, responses[0].InBandInterrupt, "on_challenge hooks must not run on invalid submission")
-				// A submission attempt emits "submitted", then "failed" (with a reason).
-				require.Len(t, events, 2)
-				require.Equal(t, appsec.SourceChallenge, events[0].Parsed["source"])
-				require.Equal(t, string(appsec.ChallengeReasonSubmitted), events[0].Parsed["challenge_event"])
-				require.Equal(t, string(appsec.ChallengeReasonFailed), events[1].Parsed["challenge_event"])
-				require.NotEmpty(t, events[1].Parsed["challenge_fail_reason"])
+				// submitted + failed log events, plus the bot-detection alert.
+				require.Len(t, events, 3)
+
+				submitted := findChallengeLog(events, appsec.ChallengeReasonSubmitted)
+				require.NotNil(t, submitted, "expected a submitted challenge log")
+				require.Equal(t, appsec.SourceChallenge, submitted.Parsed["source"])
+
+				failed := findChallengeLog(events, appsec.ChallengeReasonFailed)
+				require.NotNil(t, failed, "expected a failed challenge log")
+				require.NotEmpty(t, failed.Parsed["challenge_fail_reason"])
+
+				alertEvt := findAppsecAlert(events)
+				require.NotNil(t, alertEvt, "expected a bot-detection alert overflow")
+				require.Equal(t, types.BotDetectionAlertKind.String(), alertEvt.Overflow.Alert.Kind)
 			},
 		},
 		{
@@ -1560,6 +1706,41 @@ func TestAppsecOnChallengeHooks(t *testing.T) {
 				Method:      "GET",
 				URI:         "/protected",
 				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+		},
+		{
+			// The score accumulator is per-request state, which on_load
+			// predates entirely.
+			name:             "on_load AddRequestScore() fails to load",
+			expected_load_ok: false,
+			on_load: []appsec.Hook{
+				{Apply: []string{`AddRequestScore(15, "utc_timezone")`}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/protected",
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+		},
+		{
+			name:             "pre_eval score accumulates across hooks",
+			expected_load_ok: true,
+			pre_eval: []appsec.Hook{
+				{Filter: "true", Apply: []string{`AddRequestScore(30, "no_user_agent")`}},
+				{Filter: "true", Apply: []string{`AddRequestScore(20, "suspicious_path")`}},
+				{Filter: "RequestScore() >= 45", Apply: []string{`DropRequest("request score " + string(RequestScore()))`}},
+			},
+			input_request: appsec.ParsedRequest{
+				RemoteAddr:  "1.2.3.4",
+				Method:      "GET",
+				URI:         "/protected",
+				HTTPRequest: &http.Request{Host: "example.com"},
+			},
+			output_asserts: func(events []pipeline.Event, responses []appsec.AppsecTempResponse, appsecResponse appsec.BodyResponse, statusCode int) {
+				require.Len(t, responses, 1)
+				require.Equal(t, appsec.BanRemediation, responses[0].Action,
+					"50 points across two hooks must cross the 45 bar")
 			},
 		},
 		{
@@ -1693,6 +1874,13 @@ func TestAppsecHookVarsSurfacedInEvent(t *testing.T) {
 				// Overflow carries HookVars (propagated by AppsecEventGeneration).
 				require.Equal(t, "request_body", overflow.Appsec.HookVars["validation_error_reason"])
 				require.Equal(t, "username", overflow.Appsec.HookVars["validation_error_field"])
+
+				// ...on its own map: the parsers mutate the LOG event downstream,
+				// so the two must not alias.
+				logEvt.Appsec.HookVars["validation_error_field"] = "mutated"
+				require.Equal(t, "username", overflow.Appsec.HookVars["validation_error_field"],
+					"overflow must not share its HookVars map with the LOG event")
+				logEvt.Appsec.HookVars["validation_error_field"] = "username"
 
 				// LOG event has HookVars, matched-rules list, and drop_reason.
 				require.Equal(t, "request_body", logEvt.Appsec.HookVars["validation_error_reason"])

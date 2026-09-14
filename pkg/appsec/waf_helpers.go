@@ -100,6 +100,7 @@ func GetPreEvalEnv(ctx context.Context, w *AppsecRuntimeConfig, state *AppsecReq
 		"RemoveOutBandRuleByTag":  func(tag string) error { return w.RemoveOutbandRuleByTag(state, tag) },
 		"RemoveOutBandRuleByName": func(name string) error { return w.RemoveOutbandRuleByName(state, name) },
 		"DropRequest":             func(reason string) error { return w.DropRequest(state, request, reason) },
+		"SkipProcessing":          func(reason string) error { return w.SkipProcessing(state, request, reason) },
 		"SetChallengeBody":        func(body string) error { return w.SetChallengeBody(state, body) },
 		"SetChallengeCookie":      func(cookie cookie.AppsecCookie) error { return w.SetChallengeCookie(state, cookie) },
 		"SetRemediationByTag":     w.SetActionByTag,
@@ -127,12 +128,20 @@ func GetPreEvalEnv(ctx context.Context, w *AppsecRuntimeConfig, state *AppsecReq
 			}
 			return w.GrantChallengeCookie(state, request, reason, ttlOverride)
 		},
-		"fingerprint": state.Fingerprint,
+		"fingerprint":             state.Fingerprint,
+		"HasValidChallengeCookie": state.HasValidChallengeCookie,
 		"ValidateRequestWithSchema": func(ref string) bool {
 			return w.ValidateRequestWithSchema(ctx, state, request, ref)
 		},
 		"DisableBodyInspection": func() error { return w.DisableBodyInspection(state) },
 		"ExemptFromChallenge":   func(reason string) error { return w.ExemptFromChallenge(state, request, reason) },
+		"AddRequestScore": func(points int, reason string) error {
+			return w.AddRequestScore(state, points, reason)
+		},
+		"RequestScore":        func() int { return state.RequestScore.Total() },
+		"RequestScoreReasons": func() []string { return state.RequestScore.Reasons() },
+		"RequestScoreDetail":  func() string { return state.RequestScore.String() },
+		"RequestScoreFor":     func(reason string) int { return state.RequestScore.For(reason) },
 	}
 }
 
@@ -158,9 +167,17 @@ func GetPostEvalEnv(ctx context.Context, w *AppsecRuntimeConfig, state *AppsecRe
 		"DumpFingerprint": func(label string) string {
 			return DumpFingerprint(w.FingerprintDumpDir, label, state.Fingerprint, request)
 		},
-		"fingerprint":         state.Fingerprint,
-		"hook_vars":           state.HookVars,
-		"ExemptFromChallenge": func(reason string) error { return w.ExemptFromChallenge(state, request, reason) },
+		"fingerprint":             state.Fingerprint,
+		"hook_vars":               state.HookVars,
+		"HasValidChallengeCookie": state.HasValidChallengeCookie,
+		"ExemptFromChallenge":     func(reason string) error { return w.ExemptFromChallenge(state, request, reason) },
+		"AddRequestScore": func(points int, reason string) error {
+			return w.AddRequestScore(state, points, reason)
+		},
+		"RequestScore":        func() int { return state.RequestScore.Total() },
+		"RequestScoreReasons": func() []string { return state.RequestScore.Reasons() },
+		"RequestScoreDetail":  func() string { return state.RequestScore.String() },
+		"RequestScoreFor":     func(reason string) int { return state.RequestScore.For(reason) },
 	}
 }
 
@@ -180,7 +197,8 @@ func GetOnChallengeEnv(ctx context.Context, w *AppsecRuntimeConfig, state *Appse
 			state.PendingHTTPCode = &code
 			return nil
 		},
-		"DropRequest": func(reason string) error { return w.DropRequest(state, request, reason) },
+		"DropRequest":    func(reason string) error { return w.DropRequest(state, request, reason) },
+		"SkipProcessing": func(reason string) error { return w.SkipProcessing(state, request, reason) },
 		"SetChallengeDifficulty": func(level string) error {
 			return w.SetChallengeDifficultyPerRequest(state, level)
 		},
@@ -198,6 +216,13 @@ func GetOnChallengeEnv(ctx context.Context, w *AppsecRuntimeConfig, state *Appse
 		"EvaluateMismatches": func() *challenge.MismatchReport {
 			return w.EvaluateMismatches(state, request)
 		},
+		"AddRequestScore": func(points int, reason string) error {
+			return w.AddRequestScore(state, points, reason)
+		},
+		"RequestScore":        func() int { return state.RequestScore.Total() },
+		"RequestScoreReasons": func() []string { return state.RequestScore.Reasons() },
+		"RequestScoreDetail":  func() string { return state.RequestScore.String() },
+		"RequestScoreFor":     func(reason string) int { return state.RequestScore.For(reason) },
 	}
 }
 
@@ -274,26 +299,43 @@ func GetOnChallengeSubmitEnv(w *AppsecRuntimeConfig, state *AppsecRequestState, 
 		"DumpFingerprint": func(label string) string {
 			return DumpFingerprint(w.FingerprintDumpDir, label, state.Fingerprint, request)
 		},
+		"AddRequestScore": func(points int, reason string) error {
+			return w.AddRequestScore(state, points, reason)
+		},
+		"RequestScore":        func() int { return state.RequestScore.Total() },
+		"RequestScoreReasons": func() []string { return state.RequestScore.Reasons() },
+		"RequestScoreDetail":  func() string { return state.RequestScore.String() },
+		"RequestScoreFor":     func(reason string) int { return state.RequestScore.For(reason) },
+		"CancelAlert":         func() error { return w.CancelAlert(state) },
+		"SendAlert":           func() error { return w.SendAlert(state) },
 	}
 }
 
 func GetOnMatchEnv(w *AppsecRuntimeConfig, state *AppsecRequestState, request *ParsedRequest, evt pipeline.Event) map[string]interface{} {
 	return map[string]interface{}{
-		"evt":                 evt,
-		"req":                 request.HTTPRequest,
-		"hook_vars":           state.HookVars,
-		"IsInBand":            request.IsInBand,
-		"IsOutBand":           request.IsOutBand,
-		"SetRemediation":      func(action string) error { return w.SetAction(state, action) },
-		"SetReturnCode":       func(code int) error { return w.SetHTTPCode(state, code) },
-		"CancelEvent":         func() error { return w.CancelEvent(state) },
-		"SendEvent":           func() error { return w.SendEvent(state) },
-		"CancelAlert":         func() error { return w.CancelAlert(state) },
-		"SendAlert":           func() error { return w.SendAlert(state) },
-		"DumpRequest":         request.DumpRequest,
-		"SetChallengeBody":    func(body string) error { return w.SetChallengeBody(state, body) },
-		"SetChallengeCookie":  func(cookie cookie.AppsecCookie) error { return w.SetChallengeCookie(state, cookie) },
-		"AppsecCookie":        cookie.NewAppsecCookie,
-		"ExemptFromChallenge": func(reason string) error { return w.ExemptFromChallenge(state, request, reason) },
+		"evt":                     evt,
+		"req":                     request.HTTPRequest,
+		"hook_vars":               state.HookVars,
+		"IsInBand":                request.IsInBand,
+		"IsOutBand":               request.IsOutBand,
+		"SetRemediation":          func(action string) error { return w.SetAction(state, action) },
+		"SetReturnCode":           func(code int) error { return w.SetHTTPCode(state, code) },
+		"CancelEvent":             func() error { return w.CancelEvent(state) },
+		"SendEvent":               func() error { return w.SendEvent(state) },
+		"CancelAlert":             func() error { return w.CancelAlert(state) },
+		"SendAlert":               func() error { return w.SendAlert(state) },
+		"DumpRequest":             request.DumpRequest,
+		"SetChallengeBody":        func(body string) error { return w.SetChallengeBody(state, body) },
+		"SetChallengeCookie":      func(cookie cookie.AppsecCookie) error { return w.SetChallengeCookie(state, cookie) },
+		"AppsecCookie":            cookie.NewAppsecCookie,
+		"ExemptFromChallenge":     func(reason string) error { return w.ExemptFromChallenge(state, request, reason) },
+		"HasValidChallengeCookie": state.HasValidChallengeCookie,
+		"AddRequestScore": func(points int, reason string) error {
+			return w.AddRequestScore(state, points, reason)
+		},
+		"RequestScore":        func() int { return state.RequestScore.Total() },
+		"RequestScoreReasons": func() []string { return state.RequestScore.Reasons() },
+		"RequestScoreDetail":  func() string { return state.RequestScore.String() },
+		"RequestScoreFor":     func(reason string) int { return state.RequestScore.For(reason) },
 	}
 }
